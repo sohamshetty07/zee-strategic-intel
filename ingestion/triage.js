@@ -13,35 +13,50 @@ const VALID_CATEGORIES = [
     "Account/Ppl Movement", 
     "Interesting Read", 
     "Economic Update",
-    "Discard" // For PR fluff and irrelevant noise
+    "Discard" 
 ];
 
 async function askOllama(title, snippet) {
     const prompt = `
-    You are a strictly factual Data Analyst filtering daily news.
+    You are the Lead Commercial Intelligence Analyst for Zee Entertainment Enterprises (Sales Planning & Strategy).
+    Your job is to triage daily media news to identify threats and opportunities in the Indian broadcast and digital landscape.
     
     Article Title: ${title}
     Lead Paragraph: ${snippet}
 
-    Task:
-    1. Categorise this article into EXACTLY ONE of these categories: ${VALID_CATEGORIES.join(", ")}. 
-       - If it is minor channel PR, or a weird URL slug, categorise it as "Discard".
-    2. Assign a "Zee Relevancy Score" from 1 to 100 based strictly on this rubric:
-       - 90-100: Direct financial impact on Zee, major competitor (Jio/Disney) merger, or new MIB/TRAI broadcasting law.
-       - 70-89: Broad ad-yield trends, shift in streaming behaviour, or major leadership change at a competitor.
-       - 40-69: General economic updates, minor tech launches, or generic marketing surveys.
-       - 1-39: Unrelated industries, minor PR, or irrelevant news.
-    3. Write a sharp, ONE-SENTENCE synopsis of the facts.
+    TASK 1: Categorise the article into EXACTLY ONE of these categories: ${VALID_CATEGORIES.join(", ")}. 
+    (Use "Discard" for minor channel PR, irrelevant industries, or generic fluff).
+
+    TASK 2: MULTI-AXIS SCORING (Rate each vector from 0 to 10)
+    Evaluate the text against these four specific media industry vectors:
+    1. competitor_threat (0-10): Does this involve Reliance, Jio, Disney, Star, Sony, Sun TV, or major OTT platforms expanding footprint or merging?
+    2. regulatory_risk (0-10): Mentions of MIB, TRAI, CCI, Broadcasting Services Regulation Bill, or tariff orders.
+    3. ad_revenue_impact (0-10): Shifts in FMCG ad-spending, festive season budgets, or agency (GroupM, Dentsu, Madison) forecasts.
+    4. disruption_risk (0-10): Rise of CTV, sports rights monopolies, or Quick Commerce (Zepto, Blinkit, Instamart) siphoning traditional ad-dollars.
+
+    TASK 3: CALCULATE MASTER SCORE (1-100)
+    Calculate the 'relevance_score'. If any single vector above scores 8 or higher, the master score MUST be 80+. Otherwise, estimate a general relevance out of 100 based on the vectors.
+
+    TASK 4: EXTRACT ENTITIES & SYNOPSIS
+    - Extract an array of up to 3 key companies, agencies, or regulators mentioned.
+    - Write a sharp, purely factual ONE-SENTENCE synopsis.
 
     TAGUCHI CONSTRAINTS:
-    - DO NOT invent connections to Zee Entertainment. 
-    - You must output a number between 1 and 100 for the score.
+    - ZERO CREATIVE GUESSING. If a vector is not mentioned in the text, score it 0.
+    - Output strictly valid JSON.
 
     You MUST respond in strictly valid JSON format matching this structure:
     {
         "category": "Selected Category",
-        "score": 85,
-        "synopsis": "Your purely factual one-sentence synopsis."
+        "vectors": {
+            "competitor_threat": 0,
+            "regulatory_risk": 0,
+            "ad_revenue_impact": 0,
+            "disruption_risk": 0
+        },
+        "relevance_score": 85,
+        "entities": ["Reliance", "GroupM"],
+        "synopsis": "Your factual one-sentence synopsis."
     }
     `;
 
@@ -54,7 +69,7 @@ async function askOllama(title, snippet) {
                 prompt: prompt,
                 format: 'json',
                 stream: false,
-                options: { temperature: 0.0 } // 0.0 forces absolute determinism (no creative guessing)
+                options: { temperature: 0.0 } // 0.0 forces absolute determinism
             })
         });
 
@@ -67,7 +82,7 @@ async function askOllama(title, snippet) {
 }
 
 async function runTriage() {
-    console.log("🧠 Waking up local Ollama AI for triage...\n");
+    console.log("🧠 Waking up local Ollama AI for Multi-Axis Triage...\n");
 
     db.all("SELECT id, title, snippet FROM articles WHERE status = 'pending'", async (err, rows) => {
         if (err) {
@@ -88,10 +103,26 @@ async function runTriage() {
             const aiResult = await askOllama(row.title, row.snippet);
             
             if (aiResult) {
-                // If Ollama marks it as 'Discard' or scores it below 5, we change status to 'discarded'
-                const newStatus = (aiResult.category === 'Discard' || aiResult.score < 5) ? 'discarded' : 'triaged';
+                // Stricter Discard Logic: It must score well on at least one vector, or have a decent master score.
+                const isIrrelevant = (
+                    aiResult.category === 'Discard' || 
+                    aiResult.relevance_score < 15 || 
+                    (aiResult.vectors.competitor_threat === 0 && aiResult.vectors.regulatory_risk === 0 && aiResult.vectors.ad_revenue_impact === 0 && aiResult.vectors.disruption_risk === 0 && aiResult.relevance_score < 40)
+                );
+
+                const newStatus = isIrrelevant ? 'discarded' : 'triaged';
                 
-                // Update the database with the AI's intelligence
+                // We stringify the tags and the new entities array together for the frontend
+                const combinedTags = JSON.stringify([
+                    aiResult.category, 
+                    ...aiResult.entities.map(e => `Entity: ${e}`)
+                ]);
+
+                // We can store the vector breakdown in the snippet column temporarily, or if you add a 'metadata' column to SQLite later.
+                // For now, appending the vectors to the synopsis makes it visible in the dashboard.
+                const vectorString = `[Threat: ${aiResult.vectors.competitor_threat}/10 | Reg: ${aiResult.vectors.regulatory_risk}/10 | Ad: ${aiResult.vectors.ad_revenue_impact}/10 | Disruption: ${aiResult.vectors.disruption_risk}/10]`;
+                const enhancedSynopsis = `${aiResult.synopsis} ${vectorString}`;
+
                 const updateQuery = `
                     UPDATE articles 
                     SET relevance_score = ?, strategic_tags = ?, snippet = ?, status = ?
@@ -99,12 +130,12 @@ async function runTriage() {
                 `;
                 
                 await new Promise((resolve) => {
-                    db.run(updateQuery, [aiResult.score, JSON.stringify([aiResult.category]), aiResult.synopsis, newStatus, row.id], resolve);
+                    db.run(updateQuery, [aiResult.relevance_score, combinedTags, enhancedSynopsis, newStatus, row.id], resolve);
                 });
             }
         }
 
-        console.log("\n✅ Triage Complete! The noise has been filtered.");
+        console.log("\n✅ Multi-Axis Triage Complete! Intelligence vectors updated.");
         
         db.close((err) => {
             if (err) console.error('❌ Error closing DB:', err);
