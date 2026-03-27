@@ -1,31 +1,41 @@
 import { NextResponse } from 'next/server';
-import sqlite3 from 'sqlite3';
-import path from 'path';
+import { MongoClient } from 'mongodb';
+
+const MONGODB_URI = process.env.MONGODB_URI;
+
+let client;
+let clientPromise;
+
+if (!global._mongoClientPromise) {
+    client = new MongoClient(MONGODB_URI);
+    global._mongoClientPromise = client.connect();
+}
+clientPromise = global._mongoClientPromise;
 
 export async function GET() {
-    const dbPath = path.resolve(process.cwd(), '../db/intel.db');
+    try {
+        const dbClient = await clientPromise;
+        const db = dbClient.db('zee_intel');
+        
+        const articles = await db.collection('articles')
+            .find({})
+            .sort({ published_at: -1 })
+            .toArray();
 
-    return new Promise((resolve) => {
-        const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (err) => {
-            if (err) {
-                console.error("DB Connection Error:", err.message);
-                return resolve(NextResponse.json({ error: 'Database connection failed' }, { status: 500 }));
-            }
-        });
+        const formattedArticles = articles.map(a => ({
+            id: a._id.toString(),
+            url: a.url,
+            title: a.title,
+            snippet: a.snippet,
+            source: a.source,
+            // We are now passing the full array of tags (Category + Impact)
+            strategic_tags: a.strategic_tags || JSON.stringify(["Uncategorised"]),
+            published_at: a.published_at
+        }));
 
-        // FIXED: Explicitly added 'url' to the SELECT statement
-        const query = `
-            SELECT id, url, title, snippet, source, relevance_score, strategic_tags, status, published_at 
-            FROM articles 
-            ORDER BY published_at DESC, relevance_score DESC
-        `;
-
-        db.all(query, [], (err, rows) => {
-            db.close();
-            if (err) {
-                return resolve(NextResponse.json({ error: err.message }, { status: 500 }));
-            }
-            resolve(NextResponse.json(rows));
-        });
-    });
+        return NextResponse.json(formattedArticles);
+    } catch (error) {
+        console.error("MongoDB Connection Error:", error);
+        return NextResponse.json({ error: 'Database connection failed' }, { status: 500 });
+    }
 }

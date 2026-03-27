@@ -1,18 +1,37 @@
-const Parser = require('rss-parser');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
-const cheerio = require('cheerio');
+import Parser from 'rss-parser';
+import { MongoClient } from 'mongodb';
+import { pipeline } from '@xenova/transformers';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const parser = new Parser();
+const MONGODB_URI = process.env.MONGODB_URI;
 
-// Connect to our local vault
-const dbPath = path.resolve(__dirname, '../db/intel.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-        console.error('❌ Database connection failed:', err.message);
-        process.exit(1);
-    }
-});
+// Stage 1: Sector Classification
+const VALID_CATEGORIES = [
+    "National News", 
+    "Business Know How", 
+    "International News", 
+    "Account/Ppl Movement", 
+    "Interesting Read", 
+    "Economic Update"
+];
+
+// Stage 2: Semantic Impact Analysis
+const IMPACT_LABELS = [
+    "Major Strategic Move",
+    "Market Disruption",
+    "Regulatory Shift",
+    "Routine Business News"
+];
+
+// Entity Radar (Keyword fallback for specific companies)
+const IMPACT_TRIGGERS = {
+    "⚠️ Competitor Radar": ["reliance", "jio", "disney", "star", "sony", "sun tv", "viacom18"],
+    "🚨 Q-Commerce Watch": ["zepto", "blinkit", "instamart", "swiggy", "zomato", "quick commerce"],
+    "💰 Ad Revenue Watch": ["groupm", "madison", "fmcg", "ad spend", "festive budget", "dentsu"]
+};
 
 // The Expanded Elite Intelligence Net
 const feeds = [
@@ -31,65 +50,40 @@ const feeds = [
     { source: 'Variety', url: 'https://news.google.com/rss/search?q=site:variety.com+global+OR+streaming+when:1d' },
     { source: 'The Drum', url: 'https://news.google.com/rss/search?q=site:thedrum.com+when:1d' },
     { source: 'Campaign Live UK', url: 'https://news.google.com/rss/search?q=site:campaignlive.co.uk+when:1d' },
-    { source: 'AdAge', url: 'https://news.google.com/rss/search?q=site:adage.com+when:1d' },
-    { source: 'WARC', url: 'https://news.google.com/rss/search?q=site:warc.com+when:1d' }
+    { source: 'AdAge', url: 'https://news.google.com/rss/search?q=site:adage.com+when:1d' }
 ];
 
-const getCutoffTime = () => {
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 1);
-    cutoff.setHours(12, 0, 0, 0);
-    return cutoff;
-};
-
-const cleanTitle = (rawTitle) => {
-    return rawTitle.split(' - ')[0].trim();
-};
-
-// THE RPC PAYLOAD UNWRAPPER (Shifted Left for Database Purity)
-const decodeGoogleNewsUrl = async (sourceUrl) => {
-    if (!sourceUrl.includes('news.google.com/rss/articles/')) return sourceUrl;
-    try {
-        const res = await fetch(sourceUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-        });
-        const html = await res.text();
-        const match = html.match(/data-p="([^"]+)"/);
-        if (!match) return sourceUrl; 
-
-        let dataP = match[1].replace(/&quot;/g, '"'); 
-        const obj = JSON.parse(dataP.replace('%.@.', '["garturlreq",'));
-        const reqStr = JSON.stringify([[ ['Fbv4je', JSON.stringify([...obj.slice(0, -6), ...obj.slice(-2)]), 'null', 'generic'] ]]);
-        const payload = new URLSearchParams({ 'f.req': reqStr }).toString();
-
-        const rpcRes = await fetch('https://news.google.com/_/DotsSplashUi/data/batchexecute', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            },
-            body: payload
-        });
-
-        const rpcText = await rpcRes.text();
-        const cleanText = rpcText.replace(")]}'\n\n", "").trim();
-        const rpcData = JSON.parse(cleanText);
-        const innerData = JSON.parse(rpcData[0][2]);
-        
-        if (innerData && innerData[1]) return innerData[1];
-    } catch (e) {
-        // Silent catch, will return original URL if decryption fails
+function assignEntityTags(text) {
+    const lowerText = text.toLowerCase();
+    let tags = [];
+    for (const [tag, keywords] of Object.entries(IMPACT_TRIGGERS)) {
+        if (keywords.some(keyword => lowerText.includes(keyword))) {
+            tags.push(tag);
+        }
     }
-    return sourceUrl;
-};
+    return tags;
+}
 
-async function ingestNews() {
-    const { gotScraping } = await import('got-scraping');
+async function ingestAndTriage() {
+    console.log("🕒 Waking up Intelligence Net & Local AI Classifier...");
     
-    console.log(`🕒 Waking up Elite Intelligence Net...`);
-    const cutoffDate = getCutoffTime();
+    const client = new MongoClient(MONGODB_URI);
+    await client.connect();
+    const db = client.db('zee_intel');
+    const articlesCollection = db.collection('articles');
+
+    console.log("🧹 Purging intelligence older than 48 hours...");
+    const twoDaysAgo = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    await articlesCollection.deleteMany({ published_at: { $lt: twoDaysAgo } });
+
+    // Load the local Zero-Shot Classification Model once
+    const classifier = await pipeline('zero-shot-classification', 'Xenova/mobilebert-uncased-mnli');
+    
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - 1);
+
     let insertedCount = 0;
-    let skippedCount = 0;
+    let duplicateCount = 0;
 
     for (const feed of feeds) {
         try {
@@ -98,57 +92,64 @@ async function ingestNews() {
 
             for (const item of parsedFeed.items) {
                 const pubDate = new Date(item.pubDate);
-
-                if (pubDate >= cutoffDate && !item.title.includes("Latest News About")) {
-                    const pristineTitle = cleanTitle(item.title);
-                    
-                    // 1. Instantly Decrypt to True Publisher URL
-                    const trueUrl = await decodeGoogleNewsUrl(item.link);
-                    let robustSnippet = item.contentSnippet || "No snippet available.";
                 
-                    // 2. TLS Spoofed Deep Fetch for Triage Context
-                    try {
-                        const response = await gotScraping.get(trueUrl, {
-                            timeout: { request: 6000 } // Keep it fast so ingestion doesn't stall
-                        });
-                        
-                        if (response.statusCode === 200 && response.body) {
-                            const $ = cheerio.load(response.body);
-                            $('script, style, noscript, iframe, nav, footer, header, aside').remove();
-                            
-                            let leadText = $('p').text().replace(/\s+/g, ' ').trim();
-                            if (leadText.length > 50) {
-                                robustSnippet = leadText.substring(0, 700) + '...';
-                            }
-                        }
-                    } catch (e) {
-                        // Silently fallback to basic RSS snippet if WAF block is too aggressive
+                if (pubDate >= cutoffDate) {
+                    const pristineTitle = item.title.split(' - ')[0].trim();
+                    const snippet = item.contentSnippet || "";
+
+                    // Deduplication Filter
+                    const exists = await articlesCollection.findOne({ 
+                        $or: [{ url: item.link }, { title: pristineTitle }]
+                    });
+
+                    if (exists) {
+                        duplicateCount++;
+                        continue;
                     }
 
-                    // 3. Save True URL to SQLite Database
-                    const query = `
-                        INSERT OR IGNORE INTO articles 
-                        (url, title, snippet, source, published_at, status) 
-                        VALUES (?, ?, ?, ?, ?, 'pending')
-                    `;
-
-                    await new Promise((resolve, reject) => {
-                        db.run(query, [trueUrl, pristineTitle, robustSnippet, feed.source, pubDate.toISOString()], function(err) {
-                            if (err) reject(err);
-                            else {
-                                if (this.changes > 0) {
-                                    insertedCount++;
-                                    console.log(`   ✅ Acquired: ${pristineTitle.substring(0, 40)}...`);
-                                } else {
-                                    skippedCount++;
-                                }
-                                resolve();
-                            }
-                        });
-                    });
+                    const textToAnalyse = `${pristineTitle}. ${snippet}`;
                     
-                    // 400ms buffer to avoid slamming publishers during deep fetch
-                    await new Promise(r => setTimeout(r, 400));
+                    // --- STAGE 1: Sector Categorisation (AI) ---
+                    const aiResult = await classifier(textToAnalyse, VALID_CATEGORIES);
+                    let assignedCategory = aiResult.labels[0];
+                    if (aiResult.scores[0] < 0.25) {
+                        assignedCategory = "Interesting Read"; 
+                    }
+
+                    // --- STAGE 2: Semantic Impact Analysis (AI) ---
+                    const impactResult = await classifier(textToAnalyse, IMPACT_LABELS);
+                    const topImpact = impactResult.labels[0];
+                    const impactScore = impactResult.scores[0];
+
+                    // Gather specific keyword entity tags
+                    let impactTags = assignEntityTags(textToAnalyse);
+
+                    // Add semantic AI tags if it's not a routine news story
+                    if (topImpact !== "Routine Business News" && impactScore > 0.40) {
+                        if (topImpact === "Major Strategic Move") impactTags.push("🔥 Strategic Move");
+                        if (topImpact === "Market Disruption") impactTags.push("🚨 Market Disruption");
+                        if (topImpact === "Regulatory Shift") impactTags.push("⚖️ Regulatory Shift");
+                    }
+                    
+                    // Combine AI Sector Category with Impact Tags
+                    const combinedTags = [assignedCategory, ...impactTags];
+
+                    await articlesCollection.insertOne({
+                        url: item.link,
+                        title: pristineTitle,
+                        snippet: snippet,
+                        source: feed.source,
+                        category: assignedCategory,
+                        strategic_tags: JSON.stringify(combinedTags),
+                        published_at: pubDate,
+                        created_at: new Date()
+                    });
+
+                    console.log(`   ✅ Acquired: ${pristineTitle.substring(0, 40)}...`);
+                    if (impactTags.length > 0) {
+                        console.log(`      ↳ Flagged High Impact: [${impactTags.join(', ')}]`);
+                    }
+                    insertedCount++;
                 }
             }
         } catch (error) {
@@ -157,16 +158,13 @@ async function ingestNews() {
     }
 
     console.log(`\n==============================================`);
-    console.log(`✅ GLOBAL INGESTION COMPLETE`);
-    console.log(`📥 New strategic assets secured: ${insertedCount}`);
-    console.log(`⏭️  Known duplicates skipped: ${skippedCount}`);
+    console.log(`✅ INGESTION & 2-STAGE AI TRIAGE COMPLETE`);
+    console.log(`📥 New strategic assets: ${insertedCount}`);
+    console.log(`⏭️  Noise reduced (duplicates skipped): ${duplicateCount}`);
     console.log(`==============================================\n`);
     
-    db.close((err) => {
-        if (err) console.error('❌ Error closing DB:', err);
-        else console.log('🔌 Vault sealed. Awaiting AI Triage.');
-        process.exit(0);
-    });
+    await client.close();
+    process.exit(0);
 }
 
-ingestNews();
+ingestAndTriage();

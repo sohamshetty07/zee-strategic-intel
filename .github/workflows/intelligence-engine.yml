@@ -1,0 +1,27 @@
+name: Zee Strategic Intel Engine
+
+on:
+  schedule:
+    # Runs at 2:30 AM UTC every day (which is exactly 8:00 AM IST)
+    - cron: '30 2 * * *'
+  workflow_dispatch: # This allows you to click a button to run it manually anytime
+
+jobs:
+  triage-and-ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Root Dependencies
+        run: npm install
+
+      - name: Run AI Ingestion Script
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: node ingestion/ingestion.js
